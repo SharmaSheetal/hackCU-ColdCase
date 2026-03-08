@@ -1,3 +1,15 @@
 .env
 
 node_modules/
+
+.venv
+
+venv/
+
+*.pyc
+
+.pyre_configuration
+
+.pyre
+
+.DS_Store
