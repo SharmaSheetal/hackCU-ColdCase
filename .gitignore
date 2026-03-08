@@ -1,10 +1,8 @@
 .env
 
 node_modules/
-<<<<<<< HEAD
 *.pyc
 *__pycache__
-=======
 
 .venv
 
@@ -17,4 +15,3 @@ venv/
 .pyre
 
 .DS_Store
->>>>>>> 4dce62c5b9cad9d08cadf1b0419f77d1e03a1d0e
