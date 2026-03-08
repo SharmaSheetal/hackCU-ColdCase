@@ -11,7 +11,7 @@ def build_new_session_state(session_id: str) -> dict:
         "phase": 1,
         "questioned_characters": [],
         "found_contradictions": [],
-        "unlocked_evidence": [],
+        "unlocked_evidence": ["evidence_sticky_note", "evidence_camera_timestamp", "evidence_scoring_sheet"],
         "hints_used": 0,
         "last_hint_timestamp": None,
         "last_meter_shown_timestamp": None,

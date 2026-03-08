@@ -172,3 +172,20 @@ def start_session():
         "session_id": session["session_id"],
         "message": "New session created",
     }
+
+@router.get("/contradictions/{session_id}")
+def get_contradictions(session_id: str):
+    session = get_or_create_session(session_id)
+    return {"contradictions": session["found_contradictions"]}
+
+
+@router.get("/facts/{character_id}")
+def get_character_facts(character_id: str):
+    data = {
+        "victor": [
+            {"id": "fact_victor_timeline", "label": "Victor timeline", "x": 80, "y": 80},
+            {"id": "fact_backstage_sighting", "label": "Backstage sighting", "x": 320, "y": 180},
+            {"id": "fact_drink_access", "label": "Drink access", "x": 120, "y": 280},
+        ]
+    }
+    return {"facts": data.get(character_id, [])}
