@@ -1,6 +1,6 @@
 import logging
+import uuid
 from typing import Dict, Any
-from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException
 
 from backend.agents.orchestrator import (
@@ -14,60 +14,61 @@ from backend.agents.progress import calculate_progress_score, should_show_meter,
 from backend.agents.orchestration.hints import wrong_direction_detector, get_passive_hint
 from backend.agents.orchestration.state import get_or_create_session
 
+from backend.api.models import (
+    AccusationRequest,
+    AccusationResponse,
+    ContradictionEvent,
+    EvidenceSubmitRequest,
+    GameStateResponse,
+    HintRequest,
+    HintResponse,
+    InterviewRequest,
+    InterviewResponse,
+    ProgressData,
+    SessionStartResponse
+)
+
 log = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# --- Pydantic Models ---
-
-class InterviewRequest(BaseModel):
-    session_id: str
-    character_id: str
-    message: str
-
-class EvidenceRequest(BaseModel):
-    session_id: str
-    evidence_id: str
-
-class HintRequest(BaseModel):
-    session_id: str
-
-# --- API Endpoints ---
-
-@router.post("/interview")
-def interview_character(req: InterviewRequest):
-    """
-    Step 26: Routes player message to persona, calculates score/meter, 
-    evaluates wrong direction heuristics, appends passive hints, 
-    checks phase advancement, and returns the assembled payload.
-    """
+@router.post("/interview", response_model=InterviewResponse)
+def interview_character(payload: InterviewRequest):
     try:
         # 1. Base Routing
-        base_result = route_to_persona(req.character_id, req.message, req.session_id)
+        base_result = route_to_persona(payload.character_id, payload.player_message, payload.session_id)
         if "error" in base_result:
             raise HTTPException(status_code=400, detail=base_result["error"])
             
-        session_state = get_or_create_session(req.session_id)
+        session_state = get_or_create_session(payload.session_id)
         
         # 2. Progress Calculation
         raw_score = calculate_progress_score(session_state)
-        session_state["progress_score"] = raw_score # Keep state updated
+        session_state["progress_score"] = raw_score 
         
         # 3. Meter Display Logic
         show_meter = should_show_meter(session_state)
-        meter_flavor_text = None
+        meter_flavor_text = ""
         if show_meter:
             import time
             meter_flavor_text = get_flavor_text(raw_score, session_state)
             session_state["last_meter_shown_timestamp"] = time.time()
             session_state["last_meter_score"] = raw_score
             
-        # 4. Wrong Direction & Passive Hints (Logic extracted from internal router logic for API assembly)
+        progress_data = ProgressData(
+            show=show_meter,
+            score=raw_score,
+            label=meter_flavor_text if meter_flavor_text else "",
+            flavor_text=meter_flavor_text if meter_flavor_text else ""
+        )
+            
+        # 4. Wrong Direction & Passive Hints
         session_history = session_state.get("session_history", [])
         struggle_score = wrong_direction_detector(session_state, session_history)
         
         response_text = base_result["response"]
         passive_hint_text = None
+        hint_injected = False
         
         if struggle_score >= 2:
             phase = session_state.get("current_phase", 1)
@@ -83,28 +84,32 @@ def interview_character(req: InterviewRequest):
             else:
                 trigger_type = "stuck_on_suspect"
                 
-            passive_hint_text = get_passive_hint(req.character_id, trigger_type, session_state)
+            passive_hint_text = get_passive_hint(payload.character_id, trigger_type, session_state)
             
             if passive_hint_text:
                 response_text = f"{response_text}\n\n{passive_hint_text}"
+                hint_injected = True
                 
             session_state["session_history"] = []
             
         # 5. Advancement Checks
-        advanced = advance_phase(req.session_id)
-        
-        # Assemble Full Return Object
-        return {
-            "character_id": req.character_id,
-            "response": response_text,
-            "stress": base_result.get("stress", 0.0),
-            "questioned_characters": list(session_state.get("questioned_characters", set())),
-            "phase": session_state.get("current_phase", 1),
-            "progress_score": raw_score,
-            "show_meter": show_meter,
-            "meter_flavor_text": meter_flavor_text,
-            "phase_advanced": advanced
-        }
+        advanced = advance_phase(payload.session_id)
+
+        # 6. Found Contradiction (latest one if multiple from this turn)
+        found_contradictions_data = session_state.get("found_contradictions", [])
+        latest_ce = None
+        if found_contradictions_data:
+            latest = found_contradictions_data[-1]
+            latest_ce = ContradictionEvent(**latest)
+
+        return InterviewResponse(
+            response_text=response_text,
+            active_fact_ids=[], # No orchestrator implementation yet
+            stress_level=base_result.get("stress", 0.0),
+            contradiction_event=latest_ce,
+            progress=progress_data,
+            hint_injected=hint_injected
+        )
 
     except HTTPException:
         raise
@@ -113,36 +118,121 @@ def interview_character(req: InterviewRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/evidence")
-def present_evidence(req: EvidenceRequest):
+@router.post("/submit-evidence", response_model=GameStateResponse)
+def handle_submit_evidence(payload: EvidenceSubmitRequest):
     try:
-        result = submit_evidence(req.session_id, req.evidence_id)
+        result = submit_evidence(payload.session_id, payload.evidence_id)
         if result.get("status") == "error":
             raise HTTPException(status_code=400, detail=result["message"])
-        return result
+        
+        session_state = get_or_create_session(payload.session_id)
+        
+        return GameStateResponse(
+            phase=session_state.get("current_phase", 1),
+            questioned_characters=list(session_state.get("questioned_characters", set())),
+            found_contradictions=[ContradictionEvent(**item) for item in session_state.get("found_contradictions", [])],
+            unlocked_evidence=list(session_state.get("unlocked_evidence", set())),
+            available_endings=session_state.get("available_endings", []),
+            hints_used=session_state.get("hints_used", 0),
+            progress_score=session_state.get("progress_score", 0)
+        )
+
     except HTTPException:
         raise
     except Exception as e:
         log.error(f"Evidence error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/hint")
-def request_hint(req: HintRequest):
+
+@router.post("/hint", response_model=HintResponse)
+def request_hint_endpoint(payload: HintRequest):
     try:
-        return get_active_hint(req.session_id)
+        result = get_active_hint(payload.session_id)
+        return HintResponse(
+            hint_text=result.get("hint"),
+            cooldown_remaining=result.get("cooldown_remaining", 0),
+            hints_used=result.get("hints_used", 0)
+        )
     except Exception as e:
         log.error(f"Hint error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/state/{session_id}")
+
+@router.get("/game-state/{session_id}", response_model=GameStateResponse)
 def fetch_state(session_id: str):
     try:
-        return get_game_state(session_id)
+        session_state = get_game_state(session_id)
+        
+        return GameStateResponse(
+            phase=session_state.get("current_phase", 1),
+            questioned_characters=list(session_state.get("questioned_characters", set())),
+            found_contradictions=[ContradictionEvent(**item) for item in session_state.get("found_contradictions", [])],
+            unlocked_evidence=list(session_state.get("unlocked_evidence", set())),
+            available_endings=session_state.get("available_endings", []),
+            hints_used=session_state.get("hints_used", 0),
+            progress_score=session_state.get("progress_score", 0)
+        )
     except Exception as e:
         log.error(f"State retrieval error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Note: Additional 2 endpoints required to make "all six" endpoints.
+
+@router.post("/session/start", response_model=SessionStartResponse)
+def start_session():
+    new_id = str(uuid.uuid4())
+    session = get_or_create_session(new_id)
+    return {
+        "session_id": new_id,
+        "message": "New session created",
+    }
+
+
+@router.post("/accuse", response_model=AccusationResponse)
+def accuse(payload: AccusationRequest):
+    session = get_or_create_session(payload.session_id)
+    session_history = session.get("session_history", [])
+    session_history.append(
+        {
+            "action": "ACCUSATION",
+            "ending_choice": payload.ending_choice,
+        }
+    )
+
+    ending_map = {
+        1: "You accuse Victor of staging the incident for publicity.",
+        2: "You argue the collapse was a chain reaction caused by sabotage and panic.",
+        3: "You present the full hidden truth behind Julian's final stunt.",
+    }
+
+    return AccusationResponse(
+        ending_text=ending_map[payload.ending_choice],
+        score=78,
+        hints_used_note=f"Hints used in this session: {session.get('hints_used', 0)}",
+        full_truth_reveal=(
+            "Julian orchestrated the demo chaos himself, but the situation spiraled "
+            "through multiple small actions and misjudgments by others."
+        ),
+    )
+
+
+@router.get("/contradictions/{session_id}")
+def get_contradictions(session_id: str):
+    session = get_or_create_session(session_id)
+    return {"contradictions": session.get("found_contradictions", [])}
+
+
+@router.get("/facts/{character_id}")
+def get_character_facts(character_id: str):
+    # Mock data returned to frontend
+    data = {
+        "victor": [
+            {"id": "fact_victor_timeline", "label": "Victor timeline", "x": 80, "y": 80},
+            {"id": "fact_backstage_sighting", "label": "Backstage sighting", "x": 320, "y": 180},
+            {"id": "fact_drink_access", "label": "Drink access", "x": 120, "y": 280},
+        ]
+    }
+    return {"facts": data.get(character_id, [])}
+
 @router.post("/reset/{session_id}")
 def reset_session(session_id: str):
     from backend.agents.orchestration.state import sessions
